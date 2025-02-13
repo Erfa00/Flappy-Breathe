@@ -1,0 +1,368 @@
+#include <DFRobot_BMP3XX.h>
+#include <vector>
+#include <algorithm>
+
+//SENSOR SETUP
+DFRobot_BMP388_I2C sensor;
+uint8_t csPin = D3;
+#define CALIBRATE_ABSOLUTE_DIFFERENCE
+
+//CALCULATIONS
+const double hole_diameter = 0.002; //DIAMETER OF THE SMALL HOLE
+const double air_density = 1.225;    // Density of air in kg/m^3 at sea level
+const double dt = 0.05;               // Time step in seconds
+double Pressure;
+double previousPressure = 0.0;
+double volumeChange_mL;
+double totalVolume = 0.0;
+bool isExhaling = false;
+bool isInhaling = false;
+
+//TO REMOVE FIRST READING DEVIATION
+bool firstReading = true;
+
+//SETTING NORMAL PRESSURE
+bool baselineSet = false;
+double baselinePressure = 0.0;
+double lowerThreshold, upperThreshold;
+
+//STORING BREATHING TIME
+unsigned long inhalationStartTime = 0;
+unsigned long inhalationEndTime = 0;
+
+//STORING MAX VOLUME AND AVG AIRFLOW PER SESSION
+std::vector<float> volumeList;
+std::vector<float> flowList;
+
+
+void setup(void) {
+  pinMode(LED_BUILTIN, OUTPUT);
+  Serial.begin(115200);
+  Pressure = sensor.readPressPa();
+  previousPressure = Pressure;
+  Serial.println("First reading stored, skipping initial calculation.");
+
+  //SENSOR SETTING
+  int rslt;
+  while (ERR_OK != (rslt = sensor.begin())) {
+    if (ERR_DATA_BUS == rslt) {
+      Serial.println("Data bus error!!!");
+    } else if (ERR_IC_VERSION == rslt) {
+      Serial.println("Chip versions do not match!!!");
+    }
+    delay(3000);
+  }
+  Serial.println("Begin ok!");
+
+  while (!sensor.setSamplingMode(sensor.eUltraPrecision)) {
+    Serial.println("Set samping mode fail, retrying....");
+    delay(3000);
+  }
+
+  delay(100);
+  #ifdef CALIBRATE_ABSOLUTE_DIFFERENCE
+  if (sensor.calibratedAbsoluteDifference(540.0)) {
+    Serial.println("Absolute difference base value set successfully!");
+  }
+  #endif
+
+  /* Get the sampling period of the current measurement mode, unit: us */
+  float sampingPeriodus = sensor.getSamplingPeriodUS();
+  Serial.print("samping period : ");
+  Serial.print(sampingPeriodus);
+  Serial.println(" us");
+
+  /* Get the sampling frequency of the current measurement mode, unit: Hz */
+  float sampingFrequencyHz = 1000000000 / sampingPeriodus;
+  Serial.print("samping frequency : ");
+  Serial.print(sampingFrequencyHz);
+  Serial.println(" Hz");
+
+  Serial.println();
+  delay(1000);
+}
+
+
+void loop() {
+  
+  String a;
+  int b;
+  float test;
+
+  //UNITY WILL SEND 1-4
+
+  if (Serial.available() > 0) {
+
+    a = Serial.readString();
+    b = a.toInt();
+
+    
+    switch (b) {
+
+      //IF UNITY SENDS "1" --> IN STANDBY MODE
+      case 1:
+        
+        test = 2000; //PRINTS RANDOM NUMBER
+        digitalWrite(LED_BUILTIN, HIGH);
+        Serial.println(test);
+        break;
+
+      //IF UNITY SENDS "2" --> IN PLAY MODE
+      case 2:
+
+        
+        while (Serial.available() == 0) //THIS LOOP IS NEEDED TO CONSTANTLY CHECK SERIAL COM
+        {
+          digitalWrite(LED_BUILTIN, LOW);
+
+          //CONSTANTLY READING PRESSURE
+          Pressure = sensor.readPressPa();
+
+          //THE FIRST PRESSURE STORED AS BASELINE PRESSURE, +- 30 TO BE THE THRESHOLD
+          if(!baselineSet){
+            baselinePressure = Pressure;
+            lowerThreshold = baselinePressure - 30.0;
+            upperThreshold = baselinePressure + 30.0;
+            baselineSet = true;
+            continue;
+          }
+
+          //REMOVE FIRST READING BECAUSE THE CHANGE OF PRESSURE FROM THRESHOLD TO BREATHING PRESSURE IS TOO LARGE
+          if (firstReading) {
+            previousPressure = Pressure;  // Store first reading
+            firstReading = false;         // Skip first calculation
+            
+            continue; // Skip first loop iteration
+          }
+
+          //CONSTANTLY READING PRESSURE DIFF
+          double pressureDiff = Pressure - previousPressure;
+          previousPressure = Pressure;
+          
+          //WHERE WE CHECK IF THE PRESSURE STABILISE AGAIN AFTER BREATHING
+          if (Pressure >= lowerThreshold && Pressure <= upperThreshold){
+            //AFTER BREATHING FINISHED
+            if (isInhaling || isExhaling ){
+
+              //STORE TOTAL VOLUME PER INHALATION IN THE ARRAY
+              volumeList.push_back(totalVolume);
+              
+              
+              //INITIALISE BACK
+              totalVolume = 0.0;
+              isInhaling = false;
+              isExhaling = false;
+
+            }
+
+            //WHEN NO BREATHING OCCURS, PRINTS 0,0 TO AVOID UNITY BREAKS
+            else {
+              Serial.println("0,0");
+            }
+          }
+
+          //THIS IS WHERE WE CALCULATE CHANGE OF VOLUME PER DT
+
+          //Inhaler dimension
+          double radius = hole_diameter / 2.0;
+          double area = PI * pow(radius, 2);
+
+          // Bernoulli's principle: v = sqrt(2 * ΔP / ρ)
+          double velocity = sqrt(max(2 * abs(pressureDiff) / air_density, (double)0.0));
+
+          //WHEN INHALING VELOCITY IS POSITIVE, WHEN EXHALING VELOCITY IS NEGATIVE
+          if(pressureDiff > 0){
+            velocity = -velocity;
+          }
+
+          // Flow rate Q = A * v
+          double flowRate = 10000* 58* area * velocity;  // m^3/s
+
+          //IF INHALING, PRESSURE WILL DROP
+          if (Pressure < lowerThreshold) {
+
+            //WHEN NOT INHALING, FORCE TO BE TRUE
+            if (!isInhaling) {
+            isInhaling = true;
+            }
+
+            //TIMES 100 TO MATCH WITH REAL SPIROMETER VALUE
+            volumeChange_mL = flowRate * dt * 100;
+
+            //THIS IS WHEN WE STOP INHALING BEFORE PRESSURE IS BACK TO BASELINE, WE FORCE THESE VALUES TO BE 0, TO AVOID DEVIATIONS
+            if (volumeChange_mL <0){
+              volumeChange_mL = 0;
+              flowRate = 0;
+            }
+        
+            //CALCULATE TOTAL VOLUME, PRINT (VOLUMECHANGE_ML,FLOWRATE) TO SEND TO UNITY
+            totalVolume += volumeChange_mL;
+            Serial.print(volumeChange_mL);
+            Serial.print(",");
+            Serial.println(flowRate);
+
+            //STORE EVERY AIRFLOW IN THIS ARRAY
+            flowList.push_back(flowRate);
+    
+          }
+
+          //IF EXHALING, PRESSURE WILL INCREASE SIGNIFICANTLY
+          if(Pressure > upperThreshold)
+          {
+            if (!isExhaling){
+              
+              isExhaling = true;
+              
+            }
+
+            volumeChange_mL = flowRate * dt * 100;
+
+            if (volumeChange_mL >0){
+              volumeChange_mL = 0;
+              flowRate = 0;
+            }
+            Serial.print(volumeChange_mL);
+            Serial.print(",");
+            Serial.println(-flowRate);
+          }
+
+          delay(50); //DT CHANGE OF TIME
+
+        }
+        
+      break;
+
+      //IF UNITY SENDS "3" --> IN CALIBRATION MODE
+      case 3:
+        
+        digitalWrite(LED_BUILTIN, LOW);
+
+        while (Serial.available() == 0) //THIS LOOP IS NEEDED TO CONSTANTLY CHECK SERIAL COM
+        {
+
+          //Constantly reading Presssure
+          Pressure = sensor.readPressPa();
+
+          if(!baselineSet){
+            baselinePressure = Pressure;
+            lowerThreshold = baselinePressure - 20.0;
+            upperThreshold = baselinePressure + 20.0;
+            baselineSet = true;
+            continue;
+          }
+
+          if (firstReading) {
+            previousPressure = Pressure;  // Store first reading
+            firstReading = false;         // Skip first calculation
+            
+            continue; // Skip first loop iteration
+          }
+
+          double pressureDiff = Pressure - previousPressure;
+          previousPressure = Pressure;
+          
+
+          //WHEN PRESSURE BACK TO NORMAL AFTER INHALATION
+          if (Pressure >= lowerThreshold && Pressure <= upperThreshold){
+
+            //WHEN INHALING STOPS
+            if (isInhaling){
+              
+              //STOP TIMER
+              inhalationEndTime = millis(); // Capture end time
+              //CALCULATE INHALATION TIME
+              double inhalationTime = (inhalationEndTime - inhalationStartTime) / 1000.0; // Convert to seconds
+
+              //PRINT TO UNITY (TOTALVOLUME PER INHALATION,INHALATION TIME)
+              Serial.print(totalVolume);
+              Serial.print(",");
+              Serial.println(inhalationTime);
+              digitalWrite(LED_BUILTIN, HIGH);
+
+              //INITIALISE
+              totalVolume = 0.0; // Reset for next inhalation
+              isInhaling = false;
+
+            }
+            
+            continue;
+
+          }
+
+          //CALCULATION FOR VOLUME CHANGE SAME AS NUMBER 2
+
+          //Inhaler dimension
+          double radius = hole_diameter / 2.0;
+          double area = PI * pow(radius, 2);
+
+          // Bernoulli's principle: v = sqrt(2 * ΔP / ρ)
+          // Flow rate Q = A * v
+          double velocity = sqrt(max(2 * abs(pressureDiff) / air_density, (double)0.0));
+          if(pressureDiff > 0){
+            velocity = -velocity;
+          }
+          double flowRate = 10000* 58* area * velocity;  // m^3/s
+          
+          if(Pressure < lowerThreshold)
+          {
+            if (!isInhaling){
+              
+              isInhaling = true;
+              inhalationStartTime = millis();
+            }
+
+            volumeChange_mL = flowRate * dt * 100;
+
+            if (volumeChange_mL <0){
+              volumeChange_mL = 0;         
+            }
+
+            totalVolume += volumeChange_mL;
+            
+          }
+
+          delay(50);  
+
+        }
+      
+      break;
+
+
+      //IF UNITY SENDS "4" --> IN GAMEOVER MODE, NEEDS TO SEND BACK MAX PRESSURE & AVG AIRFLOW
+      case 4:
+
+        {
+        //DECLARE AND INITIALISE THESE VALUES
+        float maxVol = 0;
+        float sumFlow = 0;
+        float avgFlow = 0;
+        
+        //FIND THE MAXIMUM TOTAL VOLUME PER GAME SESSION
+        maxVol = *std::max_element(volumeList.begin(), volumeList.end());
+
+        //LOOP THROUGH AIRFLOW LIST
+        for (float flow : flowList) {
+        sumFlow += flow;
+        }
+
+        //CALCULATE AVERAGE AIRFLOW FROM THE ARRAY
+        avgFlow = sumFlow / flowList.size();
+        
+        //SEND TO UNITY MAXVOLUME PER SESSION,AVERAGE AIRFLOW
+        Serial.print(maxVol);
+        Serial.print(",");
+        Serial.println(avgFlow);
+
+        // **Clear the lists after printing**
+        volumeList.clear();
+        flowList.clear();
+      
+      break;
+      }
+
+      default:
+      digitalWrite(LED_BUILTIN, LOW);
+      
+    }
+  }
+}
